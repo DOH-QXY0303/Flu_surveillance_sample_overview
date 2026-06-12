@@ -1,0 +1,8 @@
+# Ignore all Excel workbooks
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# Ignore Excel temporary owner files (created when a file is open)
+~$*

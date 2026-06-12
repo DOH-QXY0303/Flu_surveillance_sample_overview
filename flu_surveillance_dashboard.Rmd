@@ -1,0 +1,245 @@
+---
+title: "Flu Surveillance Sample Dashboard"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    self_contained: true
+    theme: flatly
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Install packages if needed
+pkgs <- c("readxl", "dplyr", "lubridate", "plotly", "crosstalk",
+          "stringr", "tidyr", "shiny")
+to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(plotly)
+library(stringr)
+library(tidyr)
+```
+
+```{r load-data}
+# ── Load & clean ──────────────────────────────────────────────────────────────
+raw <- read_excel("flu_surveillance_samples_260612.xlsx", sheet = 1)
+
+df <- raw %>%
+  # De-duplicate to one row per accession (each accession may have multiple
+  # analyte rows; keep the first occurrence for counting purposes)
+  distinct(PHLAccessionNumber, .keep_all = TRUE) %>%
+  mutate(
+    # Excel serial dates → R Date
+    SpecimenDateReceived = as.Date(as.numeric(SpecimenDateReceived),
+                                   origin = "1899-12-30"),
+    # Trim whitespace from factor columns
+    across(c(SubmitterName, SubmitterCounty, PatientAddressCounty),
+           ~ str_squish(as.character(.x))),
+    # Replace blank strings with "Unknown"
+    across(c(SubmitterName, SubmitterCounty, PatientAddressCounty),
+           ~ if_else(.x == "" | is.na(.x), "Unknown", .x))
+  ) %>%
+  filter(!is.na(SpecimenDateReceived))
+
+date_min <- min(df$SpecimenDateReceived)
+date_max <- max(df$SpecimenDateReceived)
+```
+
+```{r ui-controls}
+# ── Controls (rendered as plain HTML widgets via ojs / htmltools) ─────────────
+# We embed all controls + the plot in one self-contained HTML page using
+# Plotly + vanilla JS so no Shiny server is required.
+```
+
+```{r build-plot, fig.width=12, fig.height=6}
+# ── Helper: aggregate data for a given time interval and metadata variable ────
+build_bars <- function(data, interval, meta_var) {
+
+  # Floor dates to the chosen interval
+  data <- data %>%
+    mutate(
+      time_bin = floor_date(SpecimenDateReceived,
+                            unit = switch(interval,
+                                          "Day"   = "day",
+                                          "Week"  = "week",
+                                          "Month" = "month",
+                                          "day"))
+    )
+
+  # Count per time_bin × metadata category
+  agg <- data %>%
+    group_by(time_bin, category = .data[[meta_var]]) %>%
+    summarise(n = n(), .groups = "drop")
+
+  # Total per bin (for proportion tooltip)
+  totals <- agg %>%
+    group_by(time_bin) %>%
+    summarise(total = sum(n), .groups = "drop")
+
+  agg <- agg %>%
+    left_join(totals, by = "time_bin") %>%
+    mutate(prop = round(n / total * 100, 1),
+           tooltip = paste0(category, "<br>n = ", n,
+                            " (", prop, "% of ", total, ")"))
+
+  agg
+}
+
+# ── Pre-build all combinations (interval × meta_var) for JS toggling ──────────
+intervals <- c("Day", "Week", "Month")
+meta_vars <- c("SubmitterName", "SubmitterCounty", "PatientAddressCounty")
+
+# Assign a consistent color palette per category across all combinations
+all_cats <- list(
+  SubmitterName        = sort(unique(df$SubmitterName)),
+  SubmitterCounty      = sort(unique(df$SubmitterCounty)),
+  PatientAddressCounty = sort(unique(df$PatientAddressCounty))
+)
+
+# Use a qualitative palette (Plotly Safe)
+pal_fun <- function(n) {
+  cols <- c("#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+            "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf",
+            "#aec7e8","#ffbb78","#98df8a","#ff9896","#c5b0d5",
+            "#c49c94","#f7b6d2","#c7c7c7","#dbdb8d","#9edae5")
+  rep_len(cols, n)
+}
+
+color_maps <- lapply(all_cats, function(cats) {
+  setNames(pal_fun(length(cats)), cats)
+})
+
+# Build all traces as a nested list, serialised to JSON for JS
+all_traces <- list()
+for (iv in intervals) {
+  for (mv in meta_vars) {
+    key <- paste(iv, mv, sep = "__")
+    agg <- build_bars(df, iv, mv)
+    cmap <- color_maps[[mv]]
+    cats <- all_cats[[mv]]
+    traces <- lapply(cats, function(cat) {
+      sub <- agg %>% filter(category == cat)
+      list(
+        x        = as.character(sub$time_bin),
+        y        = sub$n,
+        text     = sub$tooltip,
+        name     = cat,
+        color    = cmap[[cat]],
+        visible  = FALSE   # JS will flip these
+      )
+    })
+    # Filter out empty traces (category never appears in this interval)
+    traces <- Filter(function(t) length(t$x) > 0, traces)
+    all_traces[[key]] <- traces
+  }
+}
+
+# ── Serialise to JSON (embedded in the HTML page) ─────────────────────────────
+traces_json <- jsonlite::toJSON(all_traces, auto_unbox = TRUE, null = "null")
+```
+
+```{r output-html, results='asis'}
+# ── Embed everything as a single self-contained HTML block ────────────────────
+cat(sprintf('
+<style>
+  .ctrl-row   { display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+                margin-bottom:12px; font-family:sans-serif; }
+  .ctrl-group { display:flex; flex-direction:column; gap:4px; }
+  label       { font-size:13px; font-weight:600; color:#444; }
+  select      { padding:5px 10px; border:1px solid #ccc; border-radius:4px;
+                font-size:13px; background:#fff; cursor:pointer; }
+  select:focus{ outline:2px solid #1f77b4; }
+  #flu-plot   { width:100%%; height:520px; }
+</style>
+
+<div class="ctrl-row">
+  <div class="ctrl-group">
+    <label for="iv-sel">Time Interval</label>
+    <select id="iv-sel">
+      <option value="Day">Day</option>
+      <option value="Week" selected>Week</option>
+      <option value="Month">Month</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label for="mv-sel">Colour Bars By</label>
+    <select id="mv-sel">
+      <option value="SubmitterName">Submitter Name</option>
+      <option value="SubmitterCounty">Submitter County</option>
+      <option value="PatientAddressCounty">Patient Address County</option>
+    </select>
+  </div>
+</div>
+
+<div id="flu-plot"></div>
+
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script>
+(function() {
+  const ALL_TRACES = %s;
+
+  function buildPlotlyTraces(iv, mv) {
+    const key  = iv + "__" + mv;
+    const list = ALL_TRACES[key] || [];
+    return list.map(t => ({
+      x:           t.x,
+      y:           t.y,
+      text:        t.text,
+      name:        t.name,
+      marker:      { color: t.color },
+      type:        "bar",
+      hovertemplate: "%%{text}<extra></extra>",
+    }));
+  }
+
+  const layout = {
+    barmode: "stack",
+    xaxis: {
+      title: { text: "Specimen Date Received", font: { size: 13 } },
+      type:  "category",
+      tickangle: -35,
+      automargin: true
+    },
+    yaxis: {
+      title: { text: "Number of Samples", font: { size: 13 } },
+      rangemode: "tozero"
+    },
+    legend: {
+      orientation: "v",
+      x: 1.01, y: 1,
+      bgcolor: "rgba(255,255,255,0.8)",
+      bordercolor: "#ddd",
+      borderwidth: 1,
+      font: { size: 11 }
+    },
+    margin: { l:60, r:200, t:30, b:90 },
+    plot_bgcolor:  "#fafafa",
+    paper_bgcolor: "#ffffff",
+    hoverlabel: { align: "left" }
+  };
+
+  const config = { responsive: true, displayModeBar: true,
+                   modeBarButtonsToRemove: ["lasso2d","select2d"] };
+
+  // Initial render
+  Plotly.newPlot("flu-plot",
+    buildPlotlyTraces("Week", "SubmitterName"),
+    layout, config);
+
+  function refresh() {
+    const iv = document.getElementById("iv-sel").value;
+    const mv = document.getElementById("mv-sel").value;
+    Plotly.react("flu-plot", buildPlotlyTraces(iv, mv), layout, config);
+  }
+
+  document.getElementById("iv-sel").addEventListener("change", refresh);
+  document.getElementById("mv-sel").addEventListener("change", refresh);
+})();
+</script>
+', traces_json))
+```
